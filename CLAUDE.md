@@ -1,5 +1,10 @@
 # MLB ABS Tracker — Project Notes
 
+## Deployment
+
+- **GitHub**: https://github.com/aarrgh/abs-tracker
+- **Render (production)**: https://abs-tracker.onrender.com
+
 ## Project Structure
 
 ```
