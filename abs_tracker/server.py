@@ -2,18 +2,30 @@
 Minimal Flask web UI for MLB ABS Challenge Tracker.
 
 Routes:
-  GET /                          -> single-page HTML app
+  GET /                              -> single-page HTML app
   GET /games?date=YYYY-MM-DD                    -> JSON game list for a date
   GET /games?from=YYYY-MM-DD&to=YYYY-MM-DD     -> JSON game list for a date range
-  GET /takes?gamePk=XXXXX        -> JSON takes (all fields needed for the plot)
+  GET /takes?gamePk=XXXXX            -> JSON takes (all fields needed for the plot)
+  GET /api/stats/batters             -> JSON season batter aggregates (from PostgreSQL)
+  GET /api/stats/pitchers            -> JSON season pitcher aggregates
+  GET /api/stats/catchers            -> JSON season catcher aggregates
+  GET /api/stats/umpires             -> JSON season umpire aggregates
 """
 
 import os
 
+from dotenv import load_dotenv
+load_dotenv()
+
 from flask import Flask, Response, jsonify, request
+from sqlalchemy import create_engine, text
+from sqlalchemy.orm import Session as _DBSession
 
 from .fetcher import fetch_game_feed, fetch_games_for_date_range
 from .parser import extract_catchers, extract_hp_umpire, parse_game
+
+_DATABASE_URL = os.environ.get("DATABASE_URL")
+_db_engine = create_engine(_DATABASE_URL) if _DATABASE_URL else None
 
 app = Flask(__name__)
 
@@ -28,8 +40,17 @@ _INDEX_HTML = r"""<!DOCTYPE html>
 <title>MLB ABS Tracker</title>
 <style>
 *{box-sizing:border-box}
-body{margin:0;font-family:"Courier New",monospace;background:#0d1117;color:#c9d1d9;
-     display:flex;height:100vh;overflow:hidden}
+body{margin:0;font-family:Verdana,Geneva,sans-serif;background:#0d1117;color:#c9d1d9;
+     display:flex;flex-direction:column;height:100vh;overflow:hidden}
+/* Tab bar */
+#tab-bar{display:flex;background:#161b22;border-bottom:2px solid #21262d;flex-shrink:0;padding:0 12px}
+.tab-btn{padding:10px 18px;background:none;border:none;border-bottom:2px solid transparent;
+         color:#8b949e;cursor:pointer;font-family:inherit;font-size:13px;margin-bottom:-2px;width:auto}
+.tab-btn:hover{color:#c9d1d9}
+.tab-btn.tab-active{color:#79c0ff;border-bottom-color:#1f6feb}
+/* Game view */
+#view-game{display:flex;flex:1;overflow:hidden}
+#view-stats{display:none;flex:1;flex-direction:column;overflow:hidden}
 #sidebar{width:268px;min-width:268px;border-right:1px solid #21262d;padding:14px;
          overflow-y:auto;display:flex;flex-direction:column;gap:10px}
 #main{flex:1;padding:16px 20px;overflow-y:auto}
@@ -70,57 +91,95 @@ svg{display:block}
          cursor:pointer;color:#c9d1d9;font-size:11px;font-family:inherit;line-height:1.5}
 .fp-chip:hover{border-color:#79c0ff}
 .fp-chip.fp-active{background:#0d419d;border-color:#1f6feb}
+/* Statistics tab */
+#stats-subtabs{display:flex;gap:4px;padding:10px 14px;border-bottom:1px solid #21262d;flex-shrink:0}
+.stab-btn{padding:5px 12px;background:#161b22;border:1px solid #30363d;color:#8b949e;
+           border-radius:3px;cursor:pointer;font-family:inherit;font-size:12px;width:auto}
+.stab-btn:hover{color:#c9d1d9;border-color:#555}
+.stab-btn.stab-active{background:#0d419d;border-color:#1f6feb;color:#79c0ff}
+#stats-main{flex:1;padding:14px 16px;overflow-y:auto}
+#stats-search{padding:5px 9px;background:#161b22;border:1px solid #30363d;color:#c9d1d9;
+               border-radius:4px;font-family:inherit;font-size:12px;width:220px;margin-bottom:10px}
+#stats-search::placeholder{color:#484f58}
+#stats-tbl-wrap{overflow-x:auto}
+.stats-tbl{border-collapse:collapse;font-size:12px;white-space:nowrap}
+.stats-tbl th{padding:6px 10px;text-align:right;color:#8b949e;border-bottom:1px solid #30363d;
+               cursor:pointer;user-select:none;font-weight:normal}
+.stats-tbl th.sort-asc::after{content:" \25b2";font-size:9px}
+.stats-tbl th.sort-desc::after{content:" \25bc";font-size:9px}
+.stats-tbl td{padding:5px 10px;border-bottom:1px solid #161b22;text-align:right;color:#8b949e}
+.stats-tbl tr:hover td{background:#161b22}
+#stats-msg{font-size:12px;color:#8b949e;padding:4px 0}
 </style>
 </head>
 <body>
-<div id="sidebar">
-  <h1>MLB ABS Tracker</h1>
-  <div>
-    <label for="dt">Date</label>
-    <input type="date" id="dt">
-  </div>
-  <div>
-    <label for="teamFilter">Team</label>
-    <select id="teamFilter"><option value="">All Teams</option></select>
-  </div>
-  <div id="gameList"></div>
+<div id="tab-bar">
+  <button class="tab-btn tab-active" id="tab-game">Game View</button>
+  <button class="tab-btn" id="tab-stats">Statistics</button>
 </div>
-<div id="main">
-  <p id="placeholder" class="muted">Select a date and click a game to view the ABS zone plot.</p>
-  <p id="loadingMsg" class="muted" style="display:none">Loading\u2026</p>
-  <h2 id="plot-title"></h2>
-  <div id="plot-area">
-    <svg id="sv"></svg>
-    <div id="legend">
-      <b>Challenge Outcome</b>
-      <div class="leg"><div class="dot" style="background:#4caf50"></div>Successful (overturned)</div>
-      <div class="leg"><div class="dot" style="background:#f44336"></div>Failed (upheld)</div>
-      <div class="leg"><div class="dot" style="background:#ffeb3b"></div>Missed opportunity</div>
-      <div class="leg"><div class="dot" style="background:#9e9e9e"></div>Correct / no challenge</div>
-      <br>
-      <b>Call (stroke)</b>
-      <div class="leg"><div class="dot" style="border:2px solid #eee;background:transparent"></div>Called Strike</div>
-      <div class="leg"><div class="dot" style="border:1.5px solid #555;background:transparent"></div>Called Ball</div>
-      <br>
-      <b>Zone</b>
-      <div style="display:flex;align-items:center;gap:8px">
-        <div style="width:32px;height:12px;border:1.5px dashed #4488cc"></div>
-        <span id="zone-label">ABS ref (6'0")</span>
-      </div>
-      <br>
-      <div id="counts"></div>
+<div id="view-game">
+  <div id="sidebar">
+    <h1>MLB ABS Tracker</h1>
+    <div>
+      <label for="dt">Date</label>
+      <input type="date" id="dt">
     </div>
-    <div id="filter-panel"></div>
+    <div>
+      <label for="teamFilter">Team</label>
+      <select id="teamFilter"><option value="">All Teams</option></select>
+    </div>
+    <div id="gameList"></div>
   </div>
-  <footer style="text-align:center;padding:18px 24px;font-size:10px;color:#484f58;border-top:1px solid #21262d;margin-top:24px">
-    <a href="https://github.com/aarrgh/abs-tracker" target="_blank" rel="noopener"
-       style="color:#58a6ff;text-decoration:none;margin-bottom:6px;display:inline-flex;align-items:center;gap:5px">
-      <svg height="14" viewBox="0 0 16 16" fill="#58a6ff" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
-      aarrgh/abs-tracker
-    </a><br>
-    This tool is an independent fan project and is not affiliated with or endorsed by Major League Baseball.
-    All team names, player names, and statistical data are the property of MLB and its member clubs.
-  </footer>
+  <div id="main">
+    <p id="placeholder" class="muted">Select a date and click a game to view the ABS zone plot.</p>
+    <p id="loadingMsg" class="muted" style="display:none">Loading&#8230;</p>
+    <h2 id="plot-title"></h2>
+    <div id="plot-area">
+      <svg id="sv"></svg>
+      <div id="legend">
+        <b>Challenge Outcome</b>
+        <div class="leg"><div class="dot" style="background:#4caf50"></div>Successful (overturned)</div>
+        <div class="leg"><div class="dot" style="background:#f44336"></div>Failed (upheld)</div>
+        <div class="leg"><div class="dot" style="background:#ffeb3b"></div>Missed opportunity</div>
+        <div class="leg"><div class="dot" style="background:#9e9e9e"></div>Correct / no challenge</div>
+        <br>
+        <b>Call (stroke)</b>
+        <div class="leg"><div class="dot" style="border:2px solid #eee;background:transparent"></div>Called Strike</div>
+        <div class="leg"><div class="dot" style="border:1.5px solid #555;background:transparent"></div>Called Ball</div>
+        <br>
+        <b>Zone</b>
+        <div style="display:flex;align-items:center;gap:8px">
+          <div style="width:32px;height:12px;border:1.5px dashed #4488cc"></div>
+          <span id="zone-label">ABS ref (6'0")</span>
+        </div>
+        <br>
+        <div id="counts"></div>
+      </div>
+      <div id="filter-panel"></div>
+    </div>
+    <footer style="text-align:center;padding:18px 24px;font-size:10px;color:#484f58;border-top:1px solid #21262d;margin-top:24px">
+      <a href="https://github.com/aarrgh/abs-tracker" target="_blank" rel="noopener"
+         style="color:#58a6ff;text-decoration:none;margin-bottom:6px;display:inline-flex;align-items:center;gap:5px">
+        <svg height="14" viewBox="0 0 16 16" fill="#58a6ff" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+        aarrgh/abs-tracker
+      </a><br>
+      This tool is an independent fan project and is not affiliated with or endorsed by Major League Baseball.
+      All team names, player names, and statistical data are the property of MLB and its member clubs.
+    </footer>
+  </div>
+</div>
+<div id="view-stats">
+  <div id="stats-subtabs">
+    <button class="stab-btn stab-active" data-entity="batters">Batters</button>
+    <button class="stab-btn" data-entity="pitchers">Pitchers</button>
+    <button class="stab-btn" data-entity="catchers">Catchers</button>
+    <button class="stab-btn" data-entity="umpires">Umpires</button>
+  </div>
+  <div id="stats-main">
+    <input type="text" id="stats-search" placeholder="Filter by name&#8230;">
+    <div id="stats-msg" style="display:none"></div>
+    <div id="stats-tbl-wrap"></div>
+  </div>
 </div>
 <div id="tip"></div>
 <script>
@@ -344,7 +403,7 @@ function applyAndRender(){
 }
 
 // --- Game list: auto-load all games from opening day, filter client-side ---
-const OPENING_DAY='2026-03-26';
+const OPENING_DAY='2026-03-25';
 let allGames=[];
 
 function fmtDate(d){
@@ -434,6 +493,170 @@ async function loadGame(gamePk){
 }
 
 loadAllGames();
+
+// ---------------------------------------------------------------------------
+// Tab switching
+// ---------------------------------------------------------------------------
+function switchTab(name){
+  document.getElementById('view-game').style.display=name==='game'?'flex':'none';
+  document.getElementById('view-stats').style.display=name==='stats'?'flex':'none';
+  document.getElementById('tab-game').classList.toggle('tab-active',name==='game');
+  document.getElementById('tab-stats').classList.toggle('tab-active',name==='stats');
+  location.hash=name;
+  if(name==='stats'&&!statsCache[curEntity])fetchStatsData(curEntity);
+}
+document.getElementById('tab-game').addEventListener('click',()=>switchTab('game'));
+document.getElementById('tab-stats').addEventListener('click',()=>switchTab('stats'));
+
+// ---------------------------------------------------------------------------
+// Statistics tab
+// ---------------------------------------------------------------------------
+const statsCache={};
+const statsSort={};
+let curEntity='batters';
+
+// Column definitions: k=data key, h=header label, str=string col (sort as string), lft=left-align, pct=percentage
+const ECOLS={
+  batters:[
+    {k:'batter_name',h:'Player',str:true,lft:true},
+    {k:'team',h:'Team',str:true,lft:true},
+    {k:'takes',h:'Takes'},
+    {k:'missed_opps',h:'Missed Opp'},
+    {k:'challenges_made',h:'Challenges'},
+    {k:'successful',h:'Successful'},
+    {k:'failed',h:'Failed'},
+    {k:'success_rate',h:'Success%',pct:true},
+    {k:'wrong_calls_against',h:'Wrong Calls'},
+    {k:'wrong_call_rate',h:'Wrong%',pct:true},
+  ],
+  pitchers:[
+    {k:'pitcher_name',h:'Player',str:true,lft:true},
+    {k:'team',h:'Team',str:true,lft:true},
+    {k:'takes_against',h:'Takes'},
+    {k:'missed_opps',h:'Missed Opp'},
+    {k:'challenges_faced',h:'Challenges'},
+    {k:'challenges_won',h:'Won'},
+    {k:'challenges_lost',h:'Lost'},
+    {k:'wrong_calls_for',h:'Wrong For'},
+    {k:'wrong_calls_against',h:'Wrong Against'},
+  ],
+  catchers:[
+    {k:'catcher_name',h:'Player',str:true,lft:true},
+    {k:'team',h:'Team',str:true,lft:true},
+    {k:'takes_framed',h:'Takes'},
+    {k:'challenges_made',h:'Challenges'},
+    {k:'successful',h:'Successful'},
+    {k:'failed',h:'Failed'},
+    {k:'success_rate',h:'Success%',pct:true},
+    {k:'missed_opps',h:'Missed Opp'},
+    {k:'wrong_calls_for',h:'Wrong For'},
+    {k:'wrong_calls_against',h:'Wrong Against'},
+  ],
+  umpires:[
+    {k:'umpire_name',h:'Umpire',str:true,lft:true},
+    {k:'games_called',h:'Games'},
+    {k:'total_takes',h:'Takes'},
+    {k:'correct_calls',h:'Correct'},
+    {k:'incorrect_calls',h:'Incorrect'},
+    {k:'accuracy_rate',h:'Accuracy%',pct:true},
+    {k:'wrong_strikes',h:'Wrong Strikes'},
+    {k:'wrong_balls',h:'Wrong Balls'},
+    {k:'challenges_faced',h:'Challenges'},
+    {k:'challenges_upheld',h:'Upheld'},
+    {k:'challenges_overturned',h:'Overturned'},
+    {k:'overturn_rate',h:'Overturn%',pct:true},
+  ],
+};
+const DEFAULT_SORT_COL={batters:'takes',pitchers:'takes_against',catchers:'takes_framed',umpires:'total_takes'};
+
+document.querySelectorAll('.stab-btn').forEach(btn=>{
+  btn.addEventListener('click',()=>switchStatsTab(btn.dataset.entity));
+});
+document.getElementById('stats-search').addEventListener('input',()=>{
+  if(statsCache[curEntity])renderStatsTable(curEntity);
+});
+
+function switchStatsTab(entity){
+  curEntity=entity;
+  document.querySelectorAll('.stab-btn').forEach(b=>b.classList.toggle('stab-active',b.dataset.entity===entity));
+  document.getElementById('stats-search').value='';
+  if(!statsSort[entity])statsSort[entity]={col:DEFAULT_SORT_COL[entity],dir:'desc'};
+  if(statsCache[entity]){renderStatsTable(entity);}else{fetchStatsData(entity);}
+}
+
+async function fetchStatsData(entity){
+  const msg=document.getElementById('stats-msg');
+  msg.textContent='Loading\u2026';msg.style.color='#8b949e';msg.style.display='block';
+  document.getElementById('stats-tbl-wrap').innerHTML='';
+  try{
+    const resp=await fetch('/api/stats/'+entity);
+    if(!resp.ok)throw new Error(resp.statusText);
+    statsCache[entity]=await resp.json();
+    msg.style.display='none';
+    renderStatsTable(entity);
+  }catch(e){
+    msg.textContent='Error loading stats: '+e.message;
+    msg.style.color='#f44336';
+  }
+}
+
+function renderStatsTable(entity){
+  const data=statsCache[entity];
+  const cols=ECOLS[entity];
+  const nameKey=cols[0].k;
+  const searchVal=document.getElementById('stats-search').value.toLowerCase();
+  const sort=statsSort[entity]||{col:DEFAULT_SORT_COL[entity],dir:'desc'};
+
+  let rows=searchVal?data.filter(r=>(r[nameKey]||'').toLowerCase().includes(searchVal)):[...data];
+
+  const sortCol=cols.find(c=>c.k===sort.col);
+  if(sortCol){
+    rows.sort((a,b)=>{
+      const av=a[sort.col],bv=b[sort.col];
+      if(sortCol.str)return sort.dir==='asc'?(av||'').localeCompare(bv||''):(bv||'').localeCompare(av||'');
+      return sort.dir==='asc'?(av??-Infinity)-(bv??-Infinity):(bv??-Infinity)-(av??-Infinity);
+    });
+  }
+
+  let html='<table class="stats-tbl"><thead><tr>';
+  for(const col of cols){
+    const active=sort.col===col.k;
+    const cls=active?(sort.dir==='asc'?'sort-asc':'sort-desc'):'';
+    const align=col.lft?'text-align:left':'';
+    html+=`<th class="${cls}" data-col="${col.k}" style="${align}">${col.h}</th>`;
+  }
+  html+='</tr></thead><tbody>';
+
+  for(const r of rows){
+    html+='<tr>';
+    for(const col of cols){
+      const v=r[col.k];
+      let display;
+      if(col.pct)display=v!=null?v.toFixed(1)+'%':'\u2014';
+      else if(v==null)display='\u2014';
+      else display=v;
+      const tdStyle=col.lft?'text-align:left;color:#c9d1d9':'';
+      html+=`<td style="${tdStyle}">${display}</td>`;
+    }
+    html+='</tr>';
+  }
+  html+='</tbody></table>';
+
+  document.getElementById('stats-tbl-wrap').innerHTML=html;
+  document.getElementById('stats-msg').style.display='none';
+
+  document.querySelectorAll('.stats-tbl th[data-col]').forEach(th=>{
+    th.addEventListener('click',()=>{
+      const col=th.dataset.col;
+      const cur=statsSort[entity]||{};
+      statsSort[entity]={col,dir:cur.col===col&&cur.dir==='desc'?'asc':'desc'};
+      renderStatsTable(entity);
+    });
+  });
+}
+
+// Restore tab from URL hash on load
+if(location.hash==='#stats')switchTab('stats');
 </script>
 </body>
 </html>"""
@@ -543,6 +766,168 @@ def takes():
     return jsonify({"game_pk": game_pk, "title": title,
                     "away_team": away_abbrev, "home_team": home_abbrev,
                     "takes": result})
+
+
+# ---------------------------------------------------------------------------
+# Statistics API — queries PostgreSQL takes table
+# ---------------------------------------------------------------------------
+
+def _no_db():
+    return jsonify({"error": "Statistics database not configured."}), 503
+
+
+@app.route("/api/stats/batters")
+def stats_batters():
+    if _db_engine is None:
+        return _no_db()
+    try:
+        with _DBSession(_db_engine) as session:
+            rows = session.execute(text("""
+                SELECT
+                    t.batter_name,
+                    MAX(CASE WHEN t.inning_half='top' THEN g.away_team ELSE g.home_team END) AS team,
+                    COUNT(*) AS takes,
+                    COUNT(*) FILTER (WHERE t.missed_opportunity=TRUE AND t.umpire_call='called_strike') AS missed_opps,
+                    COUNT(*) FILTER (WHERE t.challenge_outcome IN ('successful','failed') AND t.umpire_call='called_strike') AS challenges_made,
+                    COUNT(*) FILTER (WHERE t.challenge_outcome='successful' AND t.umpire_call='called_strike') AS successful,
+                    COUNT(*) FILTER (WHERE t.challenge_outcome='failed' AND t.umpire_call='called_strike') AS failed,
+                    COUNT(*) FILTER (WHERE t.umpire_call='called_strike' AND t.in_abs_zone=FALSE) AS wrong_calls_against
+                FROM takes t
+                JOIN games g ON t.game_pk=g.game_pk
+                GROUP BY t.batter_id, t.batter_name
+                ORDER BY takes DESC
+            """)).mappings().all()
+            result = []
+            for r in rows:
+                cm = r["challenges_made"]
+                wca = r["wrong_calls_against"]
+                takes = r["takes"]
+                result.append({
+                    "batter_name": r["batter_name"],
+                    "team": r["team"],
+                    "takes": takes,
+                    "missed_opps": r["missed_opps"],
+                    "challenges_made": cm,
+                    "successful": r["successful"],
+                    "failed": r["failed"],
+                    "success_rate": round(r["successful"] / cm * 100, 1) if cm else None,
+                    "wrong_calls_against": wca,
+                    "wrong_call_rate": round(wca / takes * 100, 1) if takes else 0.0,
+                })
+        return jsonify(result)
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/api/stats/pitchers")
+def stats_pitchers():
+    if _db_engine is None:
+        return _no_db()
+    try:
+        with _DBSession(_db_engine) as session:
+            rows = session.execute(text("""
+                SELECT
+                    t.pitcher_name,
+                    MAX(CASE WHEN t.inning_half='top' THEN g.home_team ELSE g.away_team END) AS team,
+                    COUNT(*) AS takes_against,
+                    COUNT(*) FILTER (WHERE t.missed_opportunity=TRUE AND t.umpire_call='ball') AS missed_opps,
+                    COUNT(*) FILTER (WHERE t.challenge_outcome IN ('successful','failed')) AS challenges_faced,
+                    COUNT(*) FILTER (WHERE
+                        (t.umpire_call='called_strike' AND t.challenge_outcome='failed') OR
+                        (t.umpire_call='ball' AND t.challenge_outcome='successful')
+                    ) AS challenges_won,
+                    COUNT(*) FILTER (WHERE
+                        (t.umpire_call='called_strike' AND t.challenge_outcome='successful') OR
+                        (t.umpire_call='ball' AND t.challenge_outcome='failed')
+                    ) AS challenges_lost,
+                    COUNT(*) FILTER (WHERE t.missed_opportunity=TRUE AND t.umpire_call='called_strike') AS wrong_calls_for,
+                    COUNT(*) FILTER (WHERE t.missed_opportunity=TRUE AND t.umpire_call='ball') AS wrong_calls_against
+                FROM takes t
+                JOIN games g ON t.game_pk=g.game_pk
+                GROUP BY t.pitcher_id, t.pitcher_name
+                ORDER BY takes_against DESC
+            """)).mappings().all()
+        return jsonify([dict(r) for r in rows])
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/api/stats/catchers")
+def stats_catchers():
+    if _db_engine is None:
+        return _no_db()
+    try:
+        with _DBSession(_db_engine) as session:
+            rows = session.execute(text("""
+                SELECT
+                    t.catcher_name,
+                    MAX(CASE WHEN t.inning_half='top' THEN g.home_team ELSE g.away_team END) AS team,
+                    COUNT(*) AS takes_framed,
+                    COUNT(*) FILTER (WHERE t.challenge_outcome IN ('successful','failed') AND t.umpire_call='ball') AS challenges_made,
+                    COUNT(*) FILTER (WHERE t.challenge_outcome='successful' AND t.umpire_call='ball') AS successful,
+                    COUNT(*) FILTER (WHERE t.challenge_outcome='failed' AND t.umpire_call='ball') AS failed,
+                    COUNT(*) FILTER (WHERE t.missed_opportunity=TRUE AND t.umpire_call='ball') AS missed_opps,
+                    COUNT(*) FILTER (WHERE t.umpire_call='called_strike' AND t.in_abs_zone=FALSE) AS wrong_calls_for,
+                    COUNT(*) FILTER (WHERE t.umpire_call='ball' AND t.in_abs_zone=TRUE) AS wrong_calls_against
+                FROM takes t
+                JOIN games g ON t.game_pk=g.game_pk
+                WHERE t.catcher_name IS NOT NULL
+                GROUP BY t.catcher_name
+                ORDER BY takes_framed DESC
+            """)).mappings().all()
+            result = []
+            for r in rows:
+                cm = r["challenges_made"]
+                result.append({
+                    **dict(r),
+                    "success_rate": round(r["successful"] / cm * 100, 1) if cm else None,
+                })
+        return jsonify(result)
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/api/stats/umpires")
+def stats_umpires():
+    if _db_engine is None:
+        return _no_db()
+    try:
+        with _DBSession(_db_engine) as session:
+            rows = session.execute(text("""
+                SELECT
+                    t.umpire_name,
+                    COUNT(DISTINCT t.game_pk) AS games_called,
+                    COUNT(*) AS total_takes,
+                    COUNT(*) FILTER (WHERE t.in_abs_zone IS NOT NULL AND (
+                        (t.umpire_call='called_strike' AND t.in_abs_zone=TRUE) OR
+                        (t.umpire_call='ball' AND t.in_abs_zone=FALSE)
+                    )) AS correct_calls,
+                    COUNT(*) FILTER (WHERE t.in_abs_zone IS NOT NULL AND (
+                        (t.umpire_call='called_strike' AND t.in_abs_zone=FALSE) OR
+                        (t.umpire_call='ball' AND t.in_abs_zone=TRUE)
+                    )) AS incorrect_calls,
+                    COUNT(*) FILTER (WHERE t.umpire_call='called_strike' AND t.in_abs_zone=FALSE) AS wrong_strikes,
+                    COUNT(*) FILTER (WHERE t.umpire_call='ball' AND t.in_abs_zone=TRUE) AS wrong_balls,
+                    COUNT(*) FILTER (WHERE t.challenge_outcome IN ('successful','failed')) AS challenges_faced,
+                    COUNT(*) FILTER (WHERE t.challenge_outcome='failed') AS challenges_upheld,
+                    COUNT(*) FILTER (WHERE t.challenge_outcome='successful') AS challenges_overturned
+                FROM takes t
+                WHERE t.umpire_name IS NOT NULL
+                GROUP BY t.umpire_name
+                ORDER BY total_takes DESC
+            """)).mappings().all()
+            result = []
+            for r in rows:
+                assessable = r["correct_calls"] + r["incorrect_calls"]
+                cf = r["challenges_faced"]
+                result.append({
+                    **dict(r),
+                    "accuracy_rate": round(r["correct_calls"] / assessable * 100, 1) if assessable else None,
+                    "overturn_rate": round(r["challenges_overturned"] / cf * 100, 1) if cf else None,
+                })
+        return jsonify(result)
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
 
 
 def run(host: str = "127.0.0.1", port: int = 5000, debug: bool = False) -> None:

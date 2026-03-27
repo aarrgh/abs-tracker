@@ -10,6 +10,7 @@
 ```
 abs_tracker/
   models.py    — dataclasses: Pitch, ABSZone, MissedOpportunity, Game
+  pg_models.py — SQLAlchemy ORM: Game + Take tables (PostgreSQL)
   fetcher.py   — MLB Stats API client + height cache + parse_height_to_feet()
                  fetch_games_for_date() returns structured game list (gamePk, teams, status)
   parser.py    — parse_game() → (list[Pitch], list[MissedOpportunity])
@@ -18,13 +19,65 @@ abs_tracker/
   db.py        — SQLite schema + CRUD (init_db, store_game, load_pitches, etc.)
   sync.py      — season sync loop; OPENING_DAY_2026 = "2026-03-26"
   main.py      — CLI entry point; _HTML_TEMPLATE = inline SVG/JS for `plot` command
-  server.py    — Flask web UI; _INDEX_HTML = single-page app (auto-loaded game list + date/team filters + SVG plot)
+  server.py    — Flask web UI; _INDEX_HTML = single-page app with two tabs:
+                 Tab 1 "Game View": auto-loaded game list + date/team filters + SVG plot
+                 Tab 2 "Statistics": 4 sub-tabs (Batters/Pitchers/Catchers/Umpires) with
+                   sortable tables fed from /api/stats/* PostgreSQL routes
 
-requirements.txt — requests, pandas, flask, gunicorn
+ingestion.py    — PostgreSQL ingestion pipeline (standalone script, uses pg_models)
+.env            — DATABASE_URL (never committed; listed in .gitignore)
+requirements.txt — requests, pandas, flask, gunicorn, sqlalchemy, psycopg2-binary, python-dotenv
 Procfile        — Render/gunicorn entry point: `web: gunicorn abs_tracker.server:app --bind 0.0.0.0:$PORT`
 render.yaml     — Render service config (runtime: python, buildCommand, startCommand, PYTHON_VERSION=3.11.0)
 .gitignore      — excludes __pycache__, *.pyc, .env, venv/, .DS_Store, *.db
 ```
+
+## Web UI Tab Structure
+
+`_INDEX_HTML` in `server.py` is a two-tab single-page app. Tab switching is JS-only (no reload).
+URL hash updates on switch (`#game` / `#stats`) so direct links work.
+
+**Game View tab** (`#game`): existing SVG plot + sidebar (unchanged).
+
+**Statistics tab** (`#stats`): four sub-tabs — Batters, Pitchers, Catchers, Umpires.
+- Data fetched from `/api/stats/<entity>` on first click, cached in `statsCache` for the session.
+- Each table is sortable (click any column header; direction toggled; sort state per sub-tab).
+- Name filter input above each table — client-side, real-time, no fetch.
+- Default sort: total takes descending.
+- Column alignment: name/team columns left-aligned (`lft:true` in `ECOLS`); all others right.
+- Percentage columns (`pct:true`) display as `"12.3%"` or `"—"` if null (e.g. success rate with 0 challenges).
+
+**Stats column definitions** (`ECOLS` object in JS):
+- `batters`: Player, Team, Takes, Missed Opp, Challenges, Successful, Failed, Success%, Wrong Calls, Wrong%
+- `pitchers`: Player, Team, Takes, Missed Opp, Challenges, Won, Lost, Wrong For, Wrong Against
+- `catchers`: Player, Team, Takes, Challenges, Successful, Failed, Success%, Missed Opp, Wrong For, Wrong Against
+- `umpires`: Umpire, Games, Takes, Correct, Incorrect, Accuracy%, Wrong Strikes, Wrong Balls, Challenges, Upheld, Overturned, Overturn%
+
+**Stats logic** (inferred from `umpire_call` direction):
+- Batter challenges = `umpire_call='called_strike'` + challenged (disputing a strike call)
+- Defense challenges = `umpire_call='ball'` + challenged (disputing a ball call)
+- `missed_opportunity=TRUE AND umpire_call='called_strike'` → batter-side missed opp
+- `missed_opportunity=TRUE AND umpire_call='ball'` → defense-side missed opp
+- Pitcher `challenges_won` = call upheld when batter challenged OR overturned in defense's favor
+- `wrong_calls_for/against` (pitcher/catcher) = `missed_opportunity=TRUE` in each direction
+
+---
+
+## API Endpoints (Flask)
+
+| Route | Purpose |
+|-------|---------|
+| `GET /` | Single-page HTML app |
+| `GET /games?from=&to=` | JSON game list (MLB API live) |
+| `GET /takes?gamePk=` | JSON takes for one game (MLB API live) |
+| `GET /api/stats/batters` | Season batter aggregates (PostgreSQL) |
+| `GET /api/stats/pitchers` | Season pitcher aggregates (PostgreSQL) |
+| `GET /api/stats/catchers` | Season catcher aggregates (PostgreSQL) |
+| `GET /api/stats/umpires` | Season umpire aggregates (PostgreSQL) |
+
+Stats routes return `503` if `DATABASE_URL` is not set. All aggregation is server-side (raw SQL with `FILTER` clauses). No date filtering yet — all rows are season-to-date.
+
+---
 
 ## Render Deployment
 
@@ -35,7 +88,7 @@ render.yaml     — Render service config (runtime: python, buildCommand, startC
 
 ---
 
-## API Endpoints
+## MLB Stats API Endpoints
 
 | Purpose | URL |
 |---------|-----|
@@ -107,7 +160,7 @@ coefficients. `pitchData.zone` (Statcast, 1-9 = strike) can serve as a cross-che
 ## SVG Plot (shared between `plot` CLI and Flask web UI)
 
 **Game list** (sidebar, web UI only): on page load, fetches all games from `OPENING_DAY`
-(`2026-03-26`) through today via `/games?from=&to=`. `Preview` (not-yet-started) games are
+(`2026-03-25`) through today via `/games?from=&to=`. `Preview` (not-yet-started) games are
 excluded. Remaining games are sorted by date desc (most recent first). No Load button —
 date and team are client-side filters applied on `change`.
 - **Date input**: filters list to matching `game_date`; clearing shows all dates.
@@ -138,12 +191,47 @@ Both `_HTML_TEMPLATE` (main.py) and `_INDEX_HTML` (server.py) use identical SVG/
 - Stroke: white outline = Called Strike, dark = Called Ball
 - **Tooltip** "Challenged by:" line includes position tag — compares `challenger_name` against
   `catcher_name` → `(C)`, `pitcher_name` → `(P)`, `batter_name` → `(AB)`; omits tag if no match
+- **Font**: `Verdana, Geneva, sans-serif` (body); all inputs/buttons inherit via `font-family:inherit`
+
+### ⚠️ Raw string `\u` escape gotcha
+
+`_INDEX_HTML` is a Python raw string (`r"""..."""`). `\uXXXX` sequences inside `<script>` tags
+work fine — the browser's JS engine interprets them. But `\uXXXX` inside HTML (attributes,
+element text) is rendered literally by the browser. Use HTML entities (`&#8230;` for `…`, etc.)
+for any special characters that appear outside of `<script>`.
 
 ---
 
 ## Database
 
-**SQLite** (`abs_tracker.db` by default):
+### PostgreSQL (primary — for web/stats)
+
+`DATABASE_URL` must be set in `.env` locally and in Render → Settings → Environment for production.
+
+| Table | Key columns |
+|-------|-------------|
+| `games` | game_pk (PK), game_date, home_team, away_team, status, ingested_at |
+| `takes` | id (PK), game_pk (FK), game_date, inning, inning_half, batter_id/name, pitcher_id/name, catcher_name, umpire_name, px, pz, abs_zone_top/bottom, umpire_call, in_abs_zone, challenge_outcome, missed_opportunity |
+
+- `umpire_call`: original umpire decision ("called_strike" / "ball"), derived from `call_code` which is NOT retroactively updated after a challenge.
+- `challenge_outcome`: "successful" / "failed" / NULL (no challenge).
+- `catcher_id` and `umpire_id` are nullable — current parsing only exposes names, not IDs.
+- Models live in `abs_tracker/pg_models.py` (SQLAlchemy declarative, independent of Flask).
+
+**Ingestion pipeline**: `ingestion.py` (project root)
+
+```bash
+python ingestion.py                        # init DB + ingest yesterday's games (cron target)
+python ingestion.py --date 2026-03-26      # ingest a specific date
+python ingestion.py --init-db              # create tables only
+python ingestion.py --smoke-test           # ingest Opening Day + next day, print stats
+```
+
+**Ingested range** (as of 2026-03-27): 2026-03-26 (Opening Day) — 11 games, 1697 takes, 14 successful challenges, 5 failed, 103 missed opportunities.
+
+### SQLite (legacy CLI/sync)
+
+`abs_tracker.db` — used only by the CLI sync/report commands (`python -m abs_tracker sync`).
 
 | Table | Contents |
 |-------|----------|
