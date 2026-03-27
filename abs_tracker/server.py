@@ -105,7 +105,7 @@ svg{display:block}
       <b>Zone</b>
       <div style="display:flex;align-items:center;gap:8px">
         <div style="width:32px;height:12px;border:1.5px dashed #4488cc"></div>
-        <span>ABS ref (6'0")</span>
+        <span id="zone-label">ABS ref (6'0")</span>
       </div>
       <br>
       <div id="counts"></div>
@@ -163,22 +163,34 @@ function buildPlotBase(){
     transform:`rotate(-90,9,${mg.t+H/2})`});e.textContent='pZ (ft)';}
   mk('line',{x1:sx(0),y1:mg.t,x2:sx(0),y2:mg.t+H,stroke:'#21262d','stroke-width':1,'stroke-dasharray':'3,3'});
   mk('line',{x1:sx(-0.708),y1:sy(PZ0)+2,x2:sx(0.708),y2:sy(PZ0)+2,stroke:'#444','stroke-width':2});
-  const refT=6*0.535,refB=6*0.27,hw=0.708;
-  mk('rect',{x:sx(-hw),y:sy(refT),width:sx(hw)-sx(-hw),height:sy(refB)-sy(refT),
-    fill:'none',stroke:'#4488cc','stroke-width':1.5,'stroke-dasharray':'6,3'});
 }
 
 function renderPlot(takes){
   buildPlotBase();
+  const hw=0.708;
+  let refT=6*0.535,refB=6*0.27,zoneLabel="ABS ref (6\u20180\u2033)";
+  if(activeFilter&&activeFilter.role==='batter'&&currentData){
+    const bt=(currentData.takes||[]).find(t=>t.batter_name===activeFilter.name&&t.abs_zone_top!=null);
+    if(bt){
+      refT=bt.abs_zone_top;refB=bt.abs_zone_bottom;
+      const htFt=refT/0.535;
+      const ft=Math.floor(htFt),inch=Math.round((htFt-ft)*12);
+      zoneLabel=`ABS zone (${activeFilter.name}, ${ft}\u2018${inch}\u2033)`;
+    }
+  }
+  mk('rect',{x:sx(-hw),y:sy(refT),width:sx(hw)-sx(-hw),height:sy(refB)-sy(refT),
+    fill:'none',stroke:'#4488cc','stroke-width':1.5,'stroke-dasharray':'6,3'});
+  const zl=document.getElementById('zone-label');if(zl)zl.textContent=zoneLabel;
   const counts={successful:0,failed:0,missed:0,none:0};
   const ballR=2.9/24*SCALE;  // 2.9" diameter → radius in px
-  for(const t of takes){
+  const sortedTakes=[...takes].sort((a,b)=>(a.challenge_outcome==='none'?0:1)-(b.challenge_outcome==='none'?0:1));
+  for(const t of sortedTakes){
     if(t.px==null||t.pz==null)continue;
     counts[t.challenge_outcome]=(counts[t.challenge_outcome]||0)+1;
     const cx=sx(t.px),cy=sy(t.pz);
     const col=COL[t.challenge_outcome]||'#666';
     const isStrike=t.call_result==='Called Strike';
-    const c=mk('circle',{cx,cy,r:ballR,fill:col,opacity:'0.88',
+    const c=mk('circle',{cx,cy,r:ballR,fill:col,opacity:t.challenge_outcome==='none'?'0.3':'0.88',
       stroke:isStrike?'#eee':'#555','stroke-width':isStrike?1.8:.8,cursor:'pointer'});
     const zStr=t.abs_zone_bottom!=null
       ?`${t.abs_zone_bottom.toFixed(2)}\u2013${t.abs_zone_top.toFixed(2)} ft`:'N/A';
@@ -188,7 +200,8 @@ function renderPlot(takes){
       let outcomeLine='';
       if(t.has_review){
         const who=t.challenger_name||'Unknown';
-        const label=t.challenger_name&&t.challenger_name===t.catcher_name?`${who} (C)`:who;
+        const pos=t.challenger_name?(t.challenger_name===t.catcher_name?'C':t.challenger_name===t.pitcher_name?'P':t.challenger_name===t.batter_name?'AB':null):null;
+        const label=pos?`${who} (${pos})`:who;
         if(t.challenge_outcome==='successful'){
           if(t.is_strike){
             outcomeLine=`Challenged by ${label}<br>`+

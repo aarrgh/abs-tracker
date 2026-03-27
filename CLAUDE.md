@@ -121,15 +121,23 @@ Both `_HTML_TEMPLATE` (main.py) and `_INDEX_HTML` (server.py) use identical SVG/
 - SVG dimensions computed dynamically: `SW = 4*85 + 60 = 400px`, `SH = 5*85 + 56 = 481px`
 - Plot range: pX ∈ [−2, 2] ft, pZ ∈ [0.5, 5.5] ft
 - Dot radius: `2.9/24 * 85 ≈ 10.3px` (true baseball diameter at scale)
-- Reference zone rectangle: 6'0" batter (dashed blue), not batter-specific
+- **Reference zone rectangle** (dashed blue): drawn in `renderPlot()` (not `buildPlotBase()`).
+  Defaults to 6'0" (`refT=6*0.535`, `refB=6*0.27`). When a single batter chip is selected
+  (`activeFilter.role==='batter'`), uses that batter's `abs_zone_top`/`abs_zone_bottom` from
+  their pitch data (no extra fetch needed — already in takes). Legend label (`id="zone-label"`)
+  updates dynamically, e.g. `ABS zone (Aaron Judge, 6'7")`.
 - **Participants filter panel** (client-side, no new API calls): rendered to the right of the
   legend; lists unique batters, pitchers, catchers, and umpires as clickable chips. Clicking
   a chip sets `activeFilter={role,name}` and re-renders only matching takes; clicking again
   clears. JS entry points: `buildParticipants(takes)`, `renderFilterPanel(participants)`,
   `getFilteredTakes(takes)`, `applyAndRender()`.
 - Dot colors: green=overturned, red=upheld, yellow=missed opportunity, gray=correct/none
+- Dot opacity: `challenge_outcome === 'none'` → `0.3` (faded); all others → `0.88`
+- SVG z-order: takes are sorted before the draw loop (`none` first, challenged last) so
+  challenge-action dots always render on top of faded correct calls
 - Stroke: white outline = Called Strike, dark = Called Ball
-- Tooltip shows original umpire call (pre-challenge), challenger, outcome with counts
+- **Tooltip** "Challenged by:" line includes position tag — compares `challenger_name` against
+  `catcher_name` → `(C)`, `pitcher_name` → `(P)`, `batter_name` → `(AB)`; omits tag if no match
 
 ---
 
