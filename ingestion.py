@@ -24,7 +24,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from sqlalchemy import create_engine, func, select
+from sqlalchemy import create_engine, func, select, text
 from sqlalchemy.orm import Session
 
 from abs_tracker.fetcher import fetch_game_feed, fetch_games_for_date
@@ -43,8 +43,14 @@ engine = create_engine(_DATABASE_URL)
 # ---------------------------------------------------------------------------
 
 def init_db() -> None:
-    """Create all tables if they don't already exist."""
+    """Create all tables if they don't already exist, and run any column migrations."""
     Base.metadata.create_all(engine)
+    # Add is_defense_challenge column if it was added after initial schema creation
+    with engine.connect() as conn:
+        conn.execute(text(
+            "ALTER TABLE takes ADD COLUMN IF NOT EXISTS is_defense_challenge BOOLEAN"
+        ))
+        conn.commit()
     print("Database tables ready.")
 
 
@@ -52,17 +58,23 @@ def init_db() -> None:
 # Core ingestion
 # ---------------------------------------------------------------------------
 
-def ingest_game(game_pk: int) -> int:
+def ingest_game(game_pk: int, force: bool = False) -> int:
     """
     Fetch, parse, and store one game in the PostgreSQL database.
 
     Returns the number of takes inserted, or 0 if the game was already stored.
+    If force=True, deletes any existing record (cascades to takes) and re-ingests.
     Raises on unexpected errors (caller should catch and continue).
     """
     with Session(engine) as session:
-        if session.get(Game, game_pk):
-            print(f"  game {game_pk}: already in DB, skipping")
-            return 0
+        existing = session.get(Game, game_pk)
+        if existing:
+            if force:
+                session.delete(existing)
+                session.flush()
+            else:
+                print(f"  game {game_pk}: already in DB, skipping")
+                return 0
 
         feed = fetch_game_feed(game_pk)
         pitches, missed_ops = parse_game(feed)
@@ -74,6 +86,8 @@ def ingest_game(game_pk: int) -> int:
         game_date_str = game_data.get("datetime", {}).get("officialDate", "")
         home_team = teams_data.get("home", {}).get("name", "Unknown")
         away_team = teams_data.get("away", {}).get("name", "Unknown")
+        home_team_id = teams_data.get("home", {}).get("id")
+        away_team_id = teams_data.get("away", {}).get("id")
         status = game_data.get("status", {}).get("abstractGameState", "Unknown")
 
         game_row = Game(
@@ -96,12 +110,25 @@ def ingest_game(game_pk: int) -> int:
 
             if p.has_review:
                 challenge_outcome = "successful" if p.is_overturned else "failed"
+                # Determine whether the challenging team was the defense (pitcher/catcher side).
+                # When the top half is being played, the home team defends; bottom → away defends.
+                if p.challenge_team_id and home_team_id and away_team_id:
+                    defending_team_id = home_team_id if p.half_inning == "top" else away_team_id
+                    is_defense_challenge = (p.challenge_team_id == defending_team_id)
+                else:
+                    is_defense_challenge = None
             else:
                 challenge_outcome = None
+                is_defense_challenge = None
 
-            # Derive original umpire call from call_code, which is NOT
-            # retroactively updated after a challenge (unlike is_strike/is_ball).
-            umpire_call = "called_strike" if p.call_code == "C" else "ball"
+            # Reconstruct the original umpire call. Despite documentation suggesting
+            # otherwise, details.code (call_code) IS retroactively updated to the
+            # final post-challenge result. For overturned pitches, invert the final
+            # call: if the final call is a strike, the umpire originally called a ball.
+            if p.is_overturned:
+                umpire_call = "ball" if p.is_strike else "called_strike"
+            else:
+                umpire_call = "called_strike" if p.call_code == "C" else "ball"
 
             is_missed = (p.at_bat_index, p.pitch_number) in missed_keys
 
@@ -127,6 +154,7 @@ def ingest_game(game_pk: int) -> int:
                 umpire_call=umpire_call,
                 in_abs_zone=p.in_abs_zone,
                 challenge_outcome=challenge_outcome,
+                is_defense_challenge=is_defense_challenge,
                 missed_opportunity=is_missed,
             ))
 
@@ -138,24 +166,27 @@ def ingest_game(game_pk: int) -> int:
     return len(take_rows)
 
 
-def ingest_recent_games(date_str: str) -> dict:
+def ingest_recent_games(date_str: str, force: bool = False) -> dict:
     """
     Ingest all Final games for a given date (YYYY-MM-DD).
 
-    Skips games already in the database. Logs and continues on per-game errors.
+    Skips games already in the database unless force=True, which deletes and
+    re-ingests existing records. Logs and continues on per-game errors.
     Returns a summary dict.
     """
     games = fetch_games_for_date(date_str)
     final_games = [g for g in games if g.get("status") == "Final"]
 
-    with Session(engine) as session:
-        stored_pks = {row[0] for row in session.execute(select(Game.game_pk))}
-
-    new_games = [g for g in final_games if g["gamePk"] not in stored_pks]
+    if force:
+        new_games = final_games
+    else:
+        with Session(engine) as session:
+            stored_pks = {row[0] for row in session.execute(select(Game.game_pk))}
+        new_games = [g for g in final_games if g["gamePk"] not in stored_pks]
 
     print(
         f"{date_str}: {len(final_games)} Final game(s), "
-        f"{len(new_games)} new to ingest"
+        f"{len(new_games)} {'to reingest' if force else 'new to ingest'}"
     )
 
     total_takes = 0
@@ -163,7 +194,7 @@ def ingest_recent_games(date_str: str) -> dict:
     for game_meta in new_games:
         gk = game_meta["gamePk"]
         try:
-            total_takes += ingest_game(gk)
+            total_takes += ingest_game(gk, force=force)
         except Exception as exc:
             errors += 1
             print(f"  [ERROR] game {gk}: {exc}", file=sys.stderr)
@@ -249,6 +280,11 @@ if __name__ == "__main__":
         metavar="YYYY-MM-DD",
         help="Ingest a specific date instead of yesterday",
     )
+    parser.add_argument(
+        "--reingest-date",
+        metavar="YYYY-MM-DD",
+        help="Delete and re-ingest all Final games for a date (use after schema changes)",
+    )
     args = parser.parse_args()
 
     if args.smoke_test:
@@ -258,6 +294,9 @@ if __name__ == "__main__":
     elif args.date:
         init_db()
         ingest_recent_games(args.date)
+    elif args.reingest_date:
+        init_db()
+        ingest_recent_games(args.reingest_date, force=True)
     else:
         init_db()
         daily_update()

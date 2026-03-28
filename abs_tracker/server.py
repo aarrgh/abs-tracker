@@ -788,9 +788,9 @@ def stats_batters():
                     MAX(CASE WHEN t.inning_half='top' THEN g.away_team ELSE g.home_team END) AS team,
                     COUNT(*) AS takes,
                     COUNT(*) FILTER (WHERE t.missed_opportunity=TRUE AND t.umpire_call='called_strike') AS missed_opps,
-                    COUNT(*) FILTER (WHERE t.challenge_outcome IN ('successful','failed') AND t.umpire_call='called_strike') AS challenges_made,
-                    COUNT(*) FILTER (WHERE t.challenge_outcome='successful' AND t.umpire_call='called_strike') AS successful,
-                    COUNT(*) FILTER (WHERE t.challenge_outcome='failed' AND t.umpire_call='called_strike') AS failed,
+                    COUNT(*) FILTER (WHERE t.challenge_outcome IN ('successful','failed') AND t.is_defense_challenge=FALSE) AS challenges_made,
+                    COUNT(*) FILTER (WHERE t.challenge_outcome='successful' AND t.is_defense_challenge=FALSE) AS successful,
+                    COUNT(*) FILTER (WHERE t.challenge_outcome='failed' AND t.is_defense_challenge=FALSE) AS failed,
                     COUNT(*) FILTER (WHERE t.umpire_call='called_strike' AND t.in_abs_zone=FALSE) AS wrong_calls_against
                 FROM takes t
                 JOIN games g ON t.game_pk=g.game_pk
@@ -863,9 +863,9 @@ def stats_catchers():
                     t.catcher_name,
                     MAX(CASE WHEN t.inning_half='top' THEN g.home_team ELSE g.away_team END) AS team,
                     COUNT(*) AS takes_framed,
-                    COUNT(*) FILTER (WHERE t.challenge_outcome IN ('successful','failed') AND t.umpire_call='ball') AS challenges_made,
-                    COUNT(*) FILTER (WHERE t.challenge_outcome='successful' AND t.umpire_call='ball') AS successful,
-                    COUNT(*) FILTER (WHERE t.challenge_outcome='failed' AND t.umpire_call='ball') AS failed,
+                    COUNT(*) FILTER (WHERE t.challenge_outcome IN ('successful','failed') AND t.is_defense_challenge=TRUE) AS challenges_made,
+                    COUNT(*) FILTER (WHERE t.challenge_outcome='successful' AND t.is_defense_challenge=TRUE AND t.umpire_call='ball') AS successful,
+                    COUNT(*) FILTER (WHERE t.is_defense_challenge=TRUE AND NOT (t.challenge_outcome='successful' AND t.umpire_call='ball')) AS failed,
                     COUNT(*) FILTER (WHERE t.missed_opportunity=TRUE AND t.umpire_call='ball') AS missed_opps,
                     COUNT(*) FILTER (WHERE t.umpire_call='called_strike' AND t.in_abs_zone=FALSE) AS wrong_calls_for,
                     COUNT(*) FILTER (WHERE t.umpire_call='ball' AND t.in_abs_zone=TRUE) AS wrong_calls_against

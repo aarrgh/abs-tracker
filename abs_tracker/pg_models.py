@@ -74,6 +74,7 @@ class Take(Base):
     umpire_call: str = Column(String)          # "called_strike" or "ball"
     in_abs_zone: Optional[bool] = Column(Boolean, nullable=True)
     challenge_outcome: Optional[str] = Column(String, nullable=True)  # "successful"/"failed"/None
+    is_defense_challenge: Optional[bool] = Column(Boolean, nullable=True)  # True=defense, False=batter, None=no challenge
     missed_opportunity: bool = Column(Boolean, nullable=False, default=False)
 
     game = relationship("Game", back_populates="takes")

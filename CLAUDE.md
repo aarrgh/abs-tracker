@@ -134,10 +134,14 @@ liveData.boxscore.teams.{home,away}.players{}
 Call codes: `B` (ball), `C` (called strike), `*B` (ball in dirt). All others are swings.
 
 ### ⚠️ Post-challenge feed state
-After a challenge, the feed retroactively updates `isStrike`, `isBall`, `count`, and
-`call_description` to reflect the **final** call — not the original umpire call.
+After a challenge, the feed retroactively updates `isStrike`, `isBall`, `count`,
+`call_description`, **and `details.code`** to reflect the **final** call — not the
+original umpire call. (Earlier notes suggested `details.code`/`call_code` was immune;
+confirmed incorrect — it is also overwritten.)
 To reconstruct the original call for a reversed pitch: if `is_overturned=True` and
 `is_strike=True`, the original call was a **Ball** (and vice versa).
+**Ingestion uses this reconstruction** — never derive `umpire_call` directly from
+`call_code` on challenged pitches.
 
 ---
 
@@ -217,9 +221,9 @@ for any special characters that appear outside of `<script>`.
 | Table | Key columns |
 |-------|-------------|
 | `games` | game_pk (PK), game_date, home_team, away_team, status, ingested_at |
-| `takes` | id (PK), game_pk (FK), game_date, inning, inning_half, batter_id/name, pitcher_id/name, catcher_name, umpire_name, px, pz, abs_zone_top/bottom, umpire_call, in_abs_zone, challenge_outcome, missed_opportunity |
+| `takes` | id (PK), game_pk (FK), game_date, inning, inning_half, batter_id/name, pitcher_id/name, catcher_name, umpire_name, px, pz, abs_zone_top/bottom, umpire_call, in_abs_zone, challenge_outcome, is_defense_challenge, missed_opportunity |
 
-- `umpire_call`: original umpire decision ("called_strike" / "ball"), derived from `call_code` which is NOT retroactively updated after a challenge.
+- `umpire_call`: original umpire decision ("called_strike" / "ball"). For unchallenged pitches derived from `call_code`; for overturned pitches, reconstructed by inverting `is_strike` (since `details.code` is also retroactively updated to the final result).
 - `challenge_outcome`: "successful" / "failed" / NULL (no challenge).
 - `catcher_id` and `umpire_id` are nullable — current parsing only exposes names, not IDs.
 - Models live in `abs_tracker/pg_models.py` (SQLAlchemy declarative, independent of Flask).
