@@ -7,3 +7,13 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.0
+
+  - type: cron
+    name: abs-tracker-ingest
+    runtime: python
+    schedule: "0 9 * * *"
+    buildCommand: pip install -r requirements.txt
+    startCommand: python ingestion.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.0

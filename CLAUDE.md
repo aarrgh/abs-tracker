@@ -28,7 +28,7 @@ ingestion.py    — PostgreSQL ingestion pipeline (standalone script, uses pg_mo
 .env            — DATABASE_URL (never committed; listed in .gitignore)
 requirements.txt — requests, pandas, flask, gunicorn, sqlalchemy, psycopg2-binary, python-dotenv
 Procfile        — Render/gunicorn entry point: `web: gunicorn abs_tracker.server:app --bind 0.0.0.0:$PORT`
-render.yaml     — Render service config (runtime: python, buildCommand, startCommand, PYTHON_VERSION=3.11.0)
+render.yaml     — Render service config: web service (gunicorn) + cron job (ingestion.py, 9 AM UTC daily)
 .gitignore      — excludes __pycache__, *.pyc, .env, venv/, .DS_Store, *.db
 ```
 
@@ -85,6 +85,12 @@ Stats routes return `503` if `DATABASE_URL` is not set. All aggregation is serve
 - **Port**: `server.py` reads `PORT` env var (Render-injected) when run directly; gunicorn uses `--bind 0.0.0.0:$PORT` from Procfile/render.yaml
 - **Local dev**: unchanged — `python -m abs_tracker serve` still uses Flask dev server on 127.0.0.1:5000
 - **Deploy**: push to Git repo connected to Render; build/start commands are in `render.yaml`
+
+### Ingestion cron job
+
+`render.yaml` defines a second service (`abs-tracker-ingest`, type `cron`) that runs `python ingestion.py` at **9:00 AM UTC daily**. This calls `daily_update()` → ingests the previous day's Final games into PostgreSQL.
+
+**Important**: Render does not share env vars between services automatically. The `abs-tracker-ingest` cron service needs `DATABASE_URL` set in its own environment (Render dashboard → `abs-tracker-ingest` → Settings → Environment Variables).
 
 ---
 
@@ -227,7 +233,7 @@ python ingestion.py --init-db              # create tables only
 python ingestion.py --smoke-test           # ingest Opening Day + next day, print stats
 ```
 
-**Ingested range** (as of 2026-03-27): 2026-03-26 (Opening Day) — 11 games, 1697 takes, 14 successful challenges, 5 failed, 103 missed opportunities.
+**Ingested range** (as of 2026-03-28): only 2026-03-26 confirmed (Opening Day) — 11 games, 1697 takes, 14 successful challenges, 5 failed, 103 missed opportunities. Dates 2026-03-27 and 2026-03-28 need manual backfill (cron job was not configured until now).
 
 ### SQLite (legacy CLI/sync)
 
