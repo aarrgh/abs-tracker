@@ -235,9 +235,10 @@ python ingestion.py                        # init DB + ingest yesterday's games 
 python ingestion.py --date 2026-03-26      # ingest a specific date
 python ingestion.py --init-db              # create tables only
 python ingestion.py --smoke-test           # ingest Opening Day + next day, print stats
+python ingestion.py --reingest-date 2026-03-26  # delete + re-ingest a date (use after schema changes)
 ```
 
-**Ingested range** (as of 2026-03-28): only 2026-03-26 confirmed (Opening Day) — 11 games, 1697 takes, 14 successful challenges, 5 failed, 103 missed opportunities. Dates 2026-03-27 onward need manual backfill.
+**Ingested range** (as of 2026-03-28): 2026-03-26 confirmed (Opening Day) — 11 games, 1697 takes, 14 successful challenges, 5 failed, 103 missed opportunities. Dates 2026-03-27 onward need manual backfill (use `--reingest-date` after any schema migration).
 
 ### SQLite (legacy CLI/sync)
 
